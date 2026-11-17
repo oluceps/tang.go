@@ -33,6 +33,7 @@ func startTangd(t *testing.T, port int) (int, func()) {
 }
 
 func startNativeTangd(t *testing.T, port int) (int, func()) {
+	requireNativeTangd(t)
 	srv, err := NewNativeServer("testdata/keys", port)
 	require.NoError(t, err)
 	return srv.Port, func() { srv.Stop() }
@@ -43,6 +44,13 @@ func runTest(t *testing.T, nativeTangEncrypt, nativeClevisEncrypt, nativeTangDec
 		// when we switch tang between different instances there is a chance of grabbing used port under our feet
 		// only "single-tang-instance" tests can be run in parallel
 		t.Parallel()
+	}
+
+	if nativeClevisEncrypt || nativeClevisDecrypt {
+		requireClevis(t)
+	}
+	if nativeTangEncrypt || nativeTangDecrypt {
+		requireNativeTangd(t)
 	}
 
 	var port int
@@ -190,7 +198,22 @@ func TestDeriveKeysAreNotAccessible(t *testing.T) {
 	}
 }
 
+func requireNativeTangd(t *testing.T) {
+	t.Helper()
+	if _, err := findTangdExecutable(); err != nil {
+		t.Skipf("native interoperability requires tangd: %v", err)
+	}
+}
+
+func requireClevis(t *testing.T) {
+	t.Helper()
+	if _, err := exec.LookPath("clevis"); err != nil {
+		t.Skipf("native interoperability requires clevis on PATH: %v", err)
+	}
+}
+
 func encryptWithTang(t *testing.T, nativeTang bool, thp string, errorMessage string) {
+	requireClevis(t)
 	var port int
 	var stopTang func()
 	if nativeTang {

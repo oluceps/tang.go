@@ -4,7 +4,9 @@ import (
 	"crypto"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"strconv"
@@ -102,6 +104,18 @@ func unpackKey(outDir, alg, key string) error {
 		}
 	}
 
+	return unpackKeySet(outDir, h, keys)
+}
+
+func unpackKeySet(outDir string, h crypto.Hash, keys jwk.Set) error {
+	type output struct {
+		name string
+		data []byte
+	}
+
+	// Serialize and compute every destination before creating any output, so a
+	// malformed later key cannot leave an earlier key on disk.
+	outputs := make([]output, 0, keys.Len())
 	for i := range keys.Len() {
 		k, ok := keys.Key(i)
 		if !ok {
@@ -110,17 +124,37 @@ func unpackKey(outDir, alg, key string) error {
 
 		keyData, err := json.Marshal(k)
 		if err != nil {
-			return err
+			return fmt.Errorf("serialize key at index %d: %w", i, err)
 		}
 
 		thp, err := k.Thumbprint(h)
 		if err != nil {
-			return err
+			return fmt.Errorf("thumbprint key at index %d: %w", i, err)
 		}
 		name := base64.RawURLEncoding.EncodeToString(thp)
-		if err := os.WriteFile(path.Join(outDir, name+".jwk"), keyData, 0o644); err != nil {
-			return err
+		outputs = append(outputs, output{path.Join(outDir, name+".jwk"), keyData})
+	}
+
+	// Creation is exclusive: existing files (regardless of permissions) and
+	// symlinks are rejected. The batch is not atomic: completed files remain
+	// on a later failure, and a write/close failure may leave a partial file.
+	// Never remove or replace paths on failure; another process may have
+	// replaced them.
+	completed := make([]string, 0, len(outputs))
+	for _, out := range outputs {
+		f, err := os.OpenFile(out.name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("create %q: %w; completed files: %q", out.name, err, completed)
 		}
+		n, writeErr := f.Write(out.data)
+		if writeErr == nil && n != len(out.data) {
+			writeErr = io.ErrShortWrite
+		}
+		closeErr := f.Close()
+		if err := errors.Join(writeErr, closeErr); err != nil {
+			return fmt.Errorf("write/close %q (file may be incomplete): %w; completed files: %q", out.name, err, completed)
+		}
+		completed = append(completed, out.name)
 	}
 
 	return nil
@@ -159,6 +193,10 @@ func byHashName(name string) (crypto.Hash, error) {
 }
 
 func generateThumbprint(alg string, key string) error {
+	return generateThumbprintTo(os.Stdout, alg, key)
+}
+
+func generateThumbprintTo(w io.Writer, alg string, key string) error {
 	data, err := os.ReadFile(key)
 	if err != nil {
 		return err
@@ -188,23 +226,33 @@ func generateThumbprint(alg string, key string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println(base64.RawURLEncoding.EncodeToString(thp))
+		if _, err := fmt.Fprintln(w, base64.RawURLEncoding.EncodeToString(thp)); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
 func generateAdvertisement(keys []string) error {
+	return generateAdvertisementTo(os.Stdout, keys)
+}
+
+func generateAdvertisementTo(w io.Writer, keys []string) error {
 	ks, err := tang.ReadKeys(keys...)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println(string(ks.DefaultAdvertisement))
-	return nil
+	_, err = fmt.Fprintln(w, string(ks.DefaultAdvertisement))
+	return err
 }
 
 func createKey() error {
+	return createKeyTo(os.Stdout)
+}
+
+func createKeyTo(w io.Writer) error {
 	vk, err := tang.GenerateVerifyKey()
 	if err != nil {
 		return err
@@ -223,7 +271,6 @@ func createKey() error {
 		return err
 	}
 
-	fmt.Println(string(data))
-
-	return nil
+	_, err = fmt.Fprintln(w, string(data))
+	return err
 }

@@ -33,7 +33,10 @@ var algos = []crypto.Hash{
 	crypto.SHA512, /* S512 */
 }
 
-// KeySet represents a set of all keys handled by Tang
+// KeySet represents a set of all keys handled by Tang.
+// Initialize it with NewKeySet and finish adding keys and recomputing advertisements
+// before sharing it for concurrent reads. Mutating the set, its JWKs, or its
+// advertisement byte slices (including DefaultAdvertisement) requires exclusive access.
 type KeySet struct {
 	keys                 []*tangKey
 	byThumbprint         map[string]*tangKey // base64(thumbprint)->key map
@@ -120,18 +123,19 @@ func ReadKeys(keyOrDir ...string) (*KeySet, error) {
 	return ks, nil
 }
 
-// RecomputeAdvertisements recomputes advertisement files for the keys and default for the KeySet itself
+// RecomputeAdvertisements recomputes advertisement files for the keys and default for the KeySet itself.
+// If recomputation fails, all existing advertisements are left unchanged.
 func (ks *KeySet) RecomputeAdvertisements() error {
 	advertisedKeys := jwk.NewSet()
 	signKeys := jwk.NewSet()
 
 	for _, k := range ks.keys {
 		if k.advertised {
-			if keyValidForUse(k, []jwk.KeyOperation{jwk.KeyOpVerify, jwk.KeyOpSign}) {
+			canSign := keyValidForUse(k, []jwk.KeyOperation{jwk.KeyOpSign})
+			if canSign {
 				signKeys.AddKey(k)
-				advertisedKeys.AddKey(k)
 			}
-			if keyValidForUse(k, []jwk.KeyOperation{jwk.KeyOpDeriveKey}) {
+			if canSign || keyValidForUse(k, []jwk.KeyOperation{jwk.KeyOpDeriveKey}) {
 				advertisedKeys.AddKey(k)
 			}
 		}
@@ -159,14 +163,13 @@ func (ks *KeySet) RecomputeAdvertisements() error {
 		return err
 	}
 
-	ks.DefaultAdvertisement = defaultAdvertisement
-
-	for _, k := range ks.keys {
+	advertisements := make([][]byte, len(ks.keys))
+	for i, k := range ks.keys {
 		if keyValidForUse(k, []jwk.KeyOperation{jwk.KeyOpSign}) {
 			if k.advertised {
-				k.advertisement = ks.DefaultAdvertisement
+				advertisements[i] = defaultAdvertisement
 			} else {
-				// non-advertised sets need to additionally sign payload with advertised key
+				// Retained signers sign alongside the current advertised signers.
 				signSet, err := signKeys.Clone()
 				if err != nil {
 					return err
@@ -176,29 +179,37 @@ func (ks *KeySet) RecomputeAdvertisements() error {
 				if err != nil {
 					return err
 				}
-				k.advertisement = advertisement
+				advertisements[i] = advertisement
 			}
 		}
 	}
 
+	ks.DefaultAdvertisement = defaultAdvertisement
+	for i, k := range ks.keys {
+		k.advertisement = advertisements[i]
+	}
 	return nil
 }
 
 // AppendKey appends the given key to the KeySet. Advertisements are not recalculated.
 func (ks *KeySet) AppendKey(jwkKey jwk.Key, advertised bool) error {
+	if jwkKey == nil {
+		return fmt.Errorf("cannot append nil key")
+	}
 	k := &tangKey{jwkKey, advertised, nil}
-
-	ks.keys = append(ks.keys, k)
-
-	for _, a := range algos {
+	thumbprints := make([]string, len(algos))
+	for i, a := range algos {
 		thpBytes, err := k.Thumbprint(a)
 		if err != nil {
 			return err
 		}
-		thp := base64.RawURLEncoding.EncodeToString(thpBytes)
-		ks.byThumbprint[thp] = k
+		thumbprints[i] = base64.RawURLEncoding.EncodeToString(thpBytes)
 	}
 
+	ks.keys = append(ks.keys, k)
+	for _, thp := range thumbprints {
+		ks.byThumbprint[thp] = k
+	}
 	return nil
 }
 
@@ -240,8 +251,7 @@ func (ks *KeySet) Recover(thp string, data []byte) ([]byte, error) {
 }
 
 func (k *tangKey) exchange(kty jwk.Key) (jwk.Key, error) {
-	keyops, _ := kty.KeyOps()
-	if len(keyops) != 0 && !keyValidForUse(kty, []jwk.KeyOperation{jwk.KeyOpDeriveKey}) {
+	if !keyValidForUse(kty, []jwk.KeyOperation{jwk.KeyOpDeriveKey}) {
 		return nil, fmt.Errorf("expecting derive key in the request")
 	}
 	if kty.KeyType() != jwa.EC() {
@@ -314,7 +324,11 @@ func signPayload(payload []byte, signKeys jwk.Set) ([]byte, error) {
 		if !ok {
 			return nil, fmt.Errorf("key does not have an algorithm")
 		}
-		if err := h.Set(jws.AlgorithmKey, alg); err != nil {
+		signatureAlg, ok := alg.(jwa.SignatureAlgorithm)
+		if !ok {
+			return nil, fmt.Errorf("key algorithm %q is not a signature algorithm", alg.String())
+		}
+		if err := h.Set(jws.AlgorithmKey, signatureAlg); err != nil {
 			return nil, err
 		}
 		if err := h.Set(jws.ContentTypeKey, "jwk-set+json"); err != nil {
@@ -330,7 +344,7 @@ func signPayload(payload []byte, signKeys jwk.Set) ([]byte, error) {
 		p.WriteByte('.')
 		p.WriteString(base64.RawURLEncoding.EncodeToString(payload))
 
-		signer, err := jws.SignerFor(alg.(jwa.SignatureAlgorithm))
+		signer, err := jws.SignerFor(signatureAlg)
 		if err != nil {
 			return nil, err
 		}
